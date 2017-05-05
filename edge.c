@@ -57,6 +57,7 @@ struct n2n_edge
   struct peer_info *  known_peers /* = NULL*/;
   struct peer_info *  pending_peers /* = NULL*/;
   time_t              last_register /* = 0*/;
+  u_int8_t            force_central;
 };
 
 static void supernode2addr(n2n_edge_t * eee, char* addr);
@@ -287,6 +288,7 @@ static void help() {
   printf("-M <mtu>                 | Specify n2n MTU (default %d)\n", DEFAULT_MTU);
   printf("-t                       | Use http tunneling (experimental)\n");
   printf("-r                       | Enable packet forwarding through n2n community\n");
+  printf("-C                       | Not send register to peers.\n");
   printf("-v                       | Verbose\n");
 
   printf("\nEnvironment variables:\n");
@@ -367,6 +369,8 @@ void set_peer_operational( n2n_edge_t * eee, const struct n2n_packet_header * hd
 void try_send_register( n2n_edge_t * eee,
                         const struct n2n_packet_header * hdr )
 {
+  if(eee->force_central)
+    return;
   ipstr_t ip_buf;
 
   /* REVISIT: purge of pending_peers not yet done. */
@@ -1094,6 +1098,7 @@ static void startTunReadThread(n2n_edge_t *eee) {
 /* ***************************************************** */
 
 static void supernode2addr(n2n_edge_t * eee, char* addr) {
+
   char *supernode_host = strtok(addr, ":");
 
   if(supernode_host) {
@@ -1105,7 +1110,7 @@ static void supernode2addr(n2n_edge_t * eee, char* addr) {
 
     if ( supernode_port )
       eee->supernode.port = htons(atoi(supernode_port));
-    else
+    else if(eee->supernode.port == 0)
       traceEvent(TRACE_WARNING, "Bad supernode parameter (-l <host:port>)");
 
     nameerr = getaddrinfo( supernode_host, NULL, &aihints, &ainfo );
@@ -1190,6 +1195,8 @@ int main(int argc, char* argv[]) {
 #endif
   memset(&(eee.supernode), 0, sizeof(eee.supernode));
   eee.supernode.family = AF_INET;
+  eee.force_central = 0;
+  eee.supernode.port = 0;
 
   linebuffer = (char *)malloc(MAX_CMDLINE_BUFFER_LENGTH);
   if (!linebuffer) {
@@ -1233,7 +1240,7 @@ effectiveargv[effectiveargc] = 0;
   /* {int k;for(k=0;k<effectiveargc;++k)  printf("%s\n",effectiveargv[k]);} */
 
   optarg = NULL;
-  while((opt = getopt_long(effectiveargc, effectiveargv, "k:a:bc:u:g:m:M:s:d:l:p:fvhrt", long_options, NULL)) != EOF) {
+  while((opt = getopt_long(effectiveargc, effectiveargv, "k:a:bc:Cu:g:m:M:s:d:l:p:fvhrt", long_options, NULL)) != EOF) {
     switch (opt) {
     case 'a':
 		  printf("%s\n", optarg);
@@ -1243,6 +1250,9 @@ effectiveargv[effectiveargc] = 0;
       eee.community_name = strdup(optarg);
       if(strlen(eee.community_name) > COMMUNITY_LEN)
 	eee.community_name[COMMUNITY_LEN] = '\0';
+      break;
+    case 'C': /*use supernode ,not act as n2n*/
+      eee.force_central = 1;
       break;
 #ifndef WIN32
 

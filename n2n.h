@@ -198,8 +198,8 @@ typedef struct n2n_edge         n2n_edge_t;
 #define SOCKET_TIMEOUT_INTERVAL_SECS    5
 #define REGISTER_FREQUENCY              20 /* sec */
 #else  /* #if defined(DEBUG) */
-#define SOCKET_TIMEOUT_INTERVAL_SECS    10
-#define REGISTER_FREQUENCY              60 /* sec */
+#define SOCKET_TIMEOUT_INTERVAL_SECS    5
+#define REGISTER_FREQUENCY              45 /* sec */
 #endif /* #if defined(DEBUG) */
 
 #define TRACE_ERROR     0, __FILE__, __LINE__
