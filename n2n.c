@@ -108,7 +108,7 @@ int marshall_n2n_packet_header( u_int8_t * buf, const struct n2n_packet_header *
 
   print_header( "Marshalling ", hdr );
 
-  *(buf+offset) = hdr->version;
+  /**(buf+offset) = hdr->version;
   ++offset;
 
   *(buf+offset) = hdr->msg_type;
@@ -127,10 +127,14 @@ int marshall_n2n_packet_header( u_int8_t * buf, const struct n2n_packet_header *
   offset += 6;
 
   memcpy( buf+offset, hdr->dst_mac, 6 );
-  offset += 6;
+  offset += 6;*/
 
-  marshall_peer_addr( buf, &offset, &(hdr->public_ip) );
-  marshall_peer_addr( buf, &offset, &(hdr->private_ip) );
+
+  //marshall_peer_addr( buf, &offset, &(hdr->public_ip) );
+  //marshall_peer_addr( buf, &offset, &(hdr->private_ip) );
+
+  memcpy(buf,hdr,32+sizeof(struct peer_addr)+sizeof(struct peer_addr));
+  offset +=  32 + sizeof(struct peer_addr) * 2;
 
   *(buf+offset) = (hdr->pkt_type & 0xff);
   ++offset;
@@ -172,7 +176,7 @@ int unmarshall_n2n_packet_header( struct n2n_packet_header * hdr, const u_int8_t
 {
   size_t offset=0;
 
-  hdr->version = *(buf + offset);
+  /*hdr->version = *(buf + offset);
   ++offset;
 
   hdr->msg_type = *(buf + offset);
@@ -194,7 +198,10 @@ int unmarshall_n2n_packet_header( struct n2n_packet_header * hdr, const u_int8_t
   offset += 6;
 
   unmarshall_peer_addr( &(hdr->public_ip),  &offset, buf );
-  unmarshall_peer_addr( &(hdr->private_ip), &offset, buf );
+  unmarshall_peer_addr( &(hdr->private_ip), &offset, buf );*/
+
+  memcpy(hdr,buf,32+sizeof(struct peer_addr)+sizeof(struct peer_addr));
+  offset +=  32 + sizeof(struct peer_addr) * 2;
 
   hdr->pkt_type = (*(buf + offset) & 0xff); /* Make sure only 8 bits are copied. */
   ++offset;

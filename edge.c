@@ -747,13 +747,13 @@ static const struct option long_options[] = {
 static void send_packet2net(n2n_edge_t * eee,
 			    char *decrypted_msg, size_t len) {
   ipstr_t ip_buf;
-  char packet[2048];
+  char *packet = decrypted_msg;
   int data_sent_len;
   struct n2n_packet_header hdr;
   struct peer_addr destination;
   macstr_t mac_buf;
   macstr_t mac2_buf;
-  struct ether_header *eh = (struct ether_header*)decrypted_msg;
+  struct ether_header *eh = (struct ether_header*)(decrypted_msg + N2N_PKT_HDR_SIZE);
 
   /* Discard IP packets that are not originated by this hosts */
   if(!(eee->allow_routing)) {
@@ -762,7 +762,7 @@ static void send_packet2net(n2n_edge_t * eee,
 #define ETH_FRAMESIZE 14
 #define IP4_SRCOFFSET 12
       u_int32_t dst;
-      memcpy( &dst, &decrypted_msg[ETH_FRAMESIZE + IP4_SRCOFFSET], sizeof(dst) );
+      memcpy( &dst, &decrypted_msg[ETH_FRAMESIZE + IP4_SRCOFFSET + N2N_PKT_HDR_SIZE], sizeof(dst) );
 
       /* The following comparison works because device.ip_addr is stored in network order */
       if( dst != eee->device.ip_addr) {
@@ -778,15 +778,16 @@ static void send_packet2net(n2n_edge_t * eee,
   }
 
   /* Encrypt "decrypted_msg" into the second half of the n2n packet. */
-  len = TwoFishEncryptRaw((u_int8_t *)decrypted_msg,
-			  (u_int8_t *)&packet[N2N_PKT_HDR_SIZE], len, eee->enc_tf);
+  //len = TwoFishEncryptRaw((u_int8_t *)decrypted_msg,
+	//		  (u_int8_t *)&packet[N2N_PKT_HDR_SIZE], len, eee->enc_tf);
+  //memcpy(packet+N2N_PKT_HDR_SIZE,(u_int8_t *)decrypted_msg,len);
 
   /* Add the n2n header to the start of the n2n packet. */
   fill_standard_header_fields( &(eee->sinfo), &hdr, (char*)(eee->device.mac_addr) );
   hdr.msg_type = MSG_TYPE_PACKET;
   hdr.sent_by_supernode = 0;
   memcpy(hdr.community_name, eee->community_name, COMMUNITY_LEN);
-  memcpy(hdr.dst_mac, decrypted_msg, 6);
+  memcpy(hdr.dst_mac, decrypted_msg + N2N_PKT_HDR_SIZE, 6);
 
   marshall_n2n_packet_header( (u_int8_t *)packet, &hdr );
 
@@ -916,7 +917,7 @@ static void readFromTAPSocket( n2n_edge_t * eee )
   u_char decrypted_msg[2048];
   size_t len;
 
-  len = tuntap_read(&(eee->device), decrypted_msg, sizeof(decrypted_msg));
+  len = tuntap_read(&(eee->device), decrypted_msg + N2N_PKT_HDR_SIZE, sizeof(decrypted_msg) - N2N_PKT_HDR_SIZE);
 
   if((len <= 0) || (len > sizeof(decrypted_msg)))
     traceEvent(TRACE_WARNING, "read()=%d [%d/%s]\n",
@@ -939,7 +940,8 @@ void readFromIPSocket( n2n_edge_t * eee )
 {
   ipstr_t ip_buf;
   macstr_t mac_buf;
-  char packet[2048], decrypted_msg[2048];
+  char packet[2048];
+  char *decrypted_msg;
   size_t len;
   int data_sent_len;
   struct peer_addr sender;
@@ -1000,8 +1002,9 @@ void readFromIPSocket( n2n_edge_t * eee )
 	    len -= N2N_PKT_HDR_SIZE;
 
 	    /* Decrypt message first */
-	    len = TwoFishDecryptRaw((u_int8_t *)&packet[N2N_PKT_HDR_SIZE],
-				    (u_int8_t *)decrypted_msg, len, eee->dec_tf);
+	    //len = TwoFishDecryptRaw((u_int8_t *)&packet[N2N_PKT_HDR_SIZE],
+			//	    (u_int8_t *)decrypted_msg, len, eee->dec_tf);
+      decrypted_msg = packet + N2N_PKT_HDR_SIZE;
 
 	    if(len > 0) {
 	      if(check_received_packet(eee, decrypted_msg, len) == 0) {
