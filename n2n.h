@@ -190,8 +190,6 @@ struct peer_info {
 
 struct n2n_edge; /* defined in edge.c */
 typedef struct n2n_edge         n2n_edge_t;
-
-
 /* ************************************** */
 
 #if defined(DEBUG)
@@ -199,7 +197,7 @@ typedef struct n2n_edge         n2n_edge_t;
 #define REGISTER_FREQUENCY              20 /* sec */
 #else  /* #if defined(DEBUG) */
 #define SOCKET_TIMEOUT_INTERVAL_SECS    5
-#define REGISTER_FREQUENCY              45 /* sec */
+#define REGISTER_FREQUENCY              40 /* sec */
 #endif /* #if defined(DEBUG) */
 
 #define TRACE_ERROR     0, __FILE__, __LINE__
@@ -229,6 +227,7 @@ typedef struct n2n_edge         n2n_edge_t;
 extern int traceLevel;
 extern char broadcast_addr[6];
 extern char multicast_addr[6];
+extern time_t nowTime;
 
 /* Functions */
 extern void sockaddr_in2peer_addr(struct sockaddr_in *in, struct peer_addr *out);
@@ -291,7 +290,7 @@ void   peer_list_add( struct peer_info * * list,
 size_t peer_list_size( const struct peer_info * list );
 size_t purge_peer_list( struct peer_info ** peer_list, 
                         time_t purge_before );
-size_t purge_expired_registrations( struct peer_info ** peer_list );
+size_t purge_expired_registrations( struct peer_info ** peer_list , int lock_flag);
 
 /* version.c */
 extern char *version, *osName, *buildDate;

@@ -31,13 +31,14 @@
 #   define PURGE_REGISTRATION_FREQUENCY   60
 #   define REGISTRATION_TIMEOUT          120
 #else /* #if defined(DEBUG) */
-#   define PURGE_REGISTRATION_FREQUENCY   60
-#   define REGISTRATION_TIMEOUT           (60*5)
+#   define PURGE_REGISTRATION_FREQUENCY   20
+#   define REGISTRATION_TIMEOUT           (20*5)
 #endif /* #if defined(DEBUG) */
 
 
 char broadcast_addr[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 char multicast_addr[6] = { 0x01, 0x00, 0x05, 0x00, 0x00, 0x00 }; /* First 3 bytes are meaningful */
+time_t nowTime;
 
 /* ************************************** */
 
@@ -840,18 +841,18 @@ void peer_list_add( struct peer_info * * list,
 }
 
 
-size_t purge_expired_registrations( struct peer_info ** peer_list ) {
+size_t purge_expired_registrations( struct peer_info ** peer_list, int lock_flag) {
   static time_t last_purge = 0;
-  time_t now = time(NULL);
+  /*time_t now = time(NULL);*/
   size_t num_reg = 0;
 
-  if((now - last_purge) < PURGE_REGISTRATION_FREQUENCY) return 0;
+  if((nowTime - last_purge) < PURGE_REGISTRATION_FREQUENCY) return 0;
 
   traceEvent(TRACE_INFO, "Purging old registrations");
 
-  num_reg = purge_peer_list( peer_list, now-REGISTRATION_TIMEOUT );
+  num_reg = purge_peer_list( peer_list, nowTime-REGISTRATION_TIMEOUT );
 
-  last_purge = now;
+  if(lock_flag)last_purge = nowTime;
   traceEvent(TRACE_INFO, "Remove %ld registrations", num_reg);
 
   return num_reg;

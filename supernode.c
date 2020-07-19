@@ -517,8 +517,8 @@ int main(int argc, char* argv[]) {
 	}
       }
     }
-
-    purge_expired_registrations( &known_peers );
+    nowTime = time(NULL);
+    purge_expired_registrations( &known_peers, 1);
   } /* while */
 
   closesocket(udp_sinfo.sock);

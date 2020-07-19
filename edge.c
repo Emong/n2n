@@ -382,7 +382,7 @@ void try_send_register( n2n_edge_t * eee,
 
       memcpy(scan->mac_addr, hdr->src_mac, 6);
       scan->public_ip = hdr->public_ip;
-      scan->last_seen = time(NULL); /* Don't change this it marks the pending peer for removal. */
+      scan->last_seen = nowTime; /* Don't change this it marks the pending peer for removal. */
 
       peer_list_add( &(eee->pending_peers), scan );
 
@@ -435,7 +435,7 @@ void check_peer( n2n_edge_t * eee,
   else
     {
       /* Already in known_peers. */
-      update_peer_address( eee, hdr, time(NULL) );
+      update_peer_address( eee, hdr, nowTime );
     }
 }
 
@@ -497,7 +497,7 @@ void set_peer_operational( n2n_edge_t * eee, const struct n2n_packet_header * hd
 		  peer_list_size( eee->known_peers ) );
 
 
-      scan->last_seen = time(NULL);
+      scan->last_seen = nowTime;
     }
   else
     {
@@ -556,7 +556,7 @@ static void update_peer_address(n2n_edge_t * eee,
 
   while(scan != NULL)
     {
-      if(memcmp(hdr->dst_mac, scan->mac_addr, 6) == 0)
+      if(memcmp(hdr->src_mac, scan->mac_addr, 6) == 0)
         {
 	  break;
         }
@@ -669,7 +669,7 @@ static void update_registrations( n2n_edge_t * eee ) {
   /* REVISIT: BbMaj7: have shorter timeout to REGISTER to supernode if this has
    * not yet succeeded. */
 
-  if(time(NULL) < (eee->last_register+REGISTER_FREQUENCY)) return; /* Too early */
+  if(nowTime < (eee->last_register+REGISTER_FREQUENCY)) return; /* Too early */
 
   traceEvent(TRACE_NORMAL, "Registering with supernode");
   if(eee->re_resolve_supernode_ip)
@@ -680,7 +680,7 @@ static void update_registrations( n2n_edge_t * eee ) {
   /* REVISIT: turn-on gratuitous ARP with config option. */
   /* send_grat_arps(sock_fd, is_udp_sock); */
 
-  eee->last_register = time(NULL);
+  eee->last_register = nowTime;
 }
 
 /* ***************************************************** */
@@ -1398,7 +1398,7 @@ effectiveargv[effectiveargc] = 0;
     int rc, max_sock = 0;
     fd_set socket_mask;
     struct timeval wait_time;
-    time_t nowTime;
+    /*time_t nowTime;*/
 
     FD_ZERO(&socket_mask);
     FD_SET(eee.sinfo.sock, &socket_mask);
@@ -1435,8 +1435,8 @@ effectiveargv[effectiveargc] = 0;
 
     update_registrations(&eee);
 
-    numPurged =  purge_expired_registrations( &(eee.known_peers) );
-    numPurged += purge_expired_registrations( &(eee.pending_peers) );
+    numPurged =  purge_expired_registrations( &(eee.known_peers), 0);
+    numPurged += purge_expired_registrations( &(eee.pending_peers), 1);
     if ( numPurged > 0 )
       {
         traceEvent( TRACE_NORMAL, "Peer removed: pending=%ld, operational=%ld",
