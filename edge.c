@@ -86,10 +86,13 @@ struct fec_tx_state {
   int       idx;             /* current data block index 0..k-1 */
   uint16_t  group_id;
   fec_block_t blk[FEC_MAX_K];
-  time_t    first_seen;
+  time_t    first_seen;      /* when the group started buffering */
+  struct peer_addr dest;     /* destination peer of this group */
 };
 
 #define FEC_RX_GROUPS_MAX   16
+#define FEC_FLUSH_TIMEOUT   3   /* seconds; flush a partial FEC group
+                                   even if not full, to keep latency low */
 
 struct n2n_edge
 {
@@ -936,9 +939,14 @@ static void fec_tx_flush(n2n_edge_t * eee, const struct peer_addr *dest)
   uint16_t lens[FEC_MAX_K];
   int i;
   size_t maxlen = 0;
+  const struct peer_addr *to;
 
   if (tx->idx == 0)
     return; /* nothing buffered */
+
+  /* Use the group's recorded destination when none is supplied (timeout
+   * flush from the main loop). */
+  to = dest ? dest : &tx->dest;
 
   /* Determine the maximum block length in the group and the per-block lengths. */
   for (i = 0; i < eee->fec_k; i++)
@@ -978,12 +986,12 @@ static void fec_tx_flush(n2n_edge_t * eee, const struct peer_addr *dest)
 
   /* Send data blocks (padded to maxlen so the receiver can decode). */
   for (i = 0; i < eee->fec_k; i++)
-    fec_send_block(eee, dest, tx->group_id, tx->seq_base, i,
+    fec_send_block(eee, to, tx->group_id, tx->seq_base, i,
                    eee->fec_k, eee->fec_r, lens, tx->blk[i].data, maxlen);
 
   /* Send parity blocks. */
   for (i = 0; i < eee->fec_r; i++)
-    fec_send_block(eee, dest, tx->group_id, tx->seq_base,
+    fec_send_block(eee, to, tx->group_id, tx->seq_base,
                    eee->fec_k + i, eee->fec_k, eee->fec_r, lens, parity[i], maxlen);
 
   traceEvent(TRACE_INFO, "FEC: flushed group id=%d k=%d r=%d len=%d",
@@ -1052,6 +1060,12 @@ static void send_packet2net(n2n_edge_t * eee,
           tx->group_id++;
           tx->seq_base++;
           tx->first_seen = nowTime;
+          /* Remember the group destination so a timeout flush can still
+           * reach the right peer. */
+          if (find_peer_destination(eee, eh->ether_dhost, &destination))
+            tx->dest = destination;
+          else
+            tx->dest = eee->supernode;
         }
 
       /* buffer this frame as the next data block.
@@ -1064,12 +1078,7 @@ static void send_packet2net(n2n_edge_t * eee,
 
       /* flush when the group is full */
       if (tx->idx >= eee->fec_k)
-        {
-          if (find_peer_destination(eee, eh->ether_dhost, &destination))
-            fec_tx_flush(eee, &destination);
-          else
-            fec_tx_flush(eee, &(eee->supernode));
-        }
+        fec_tx_flush(eee, NULL); /* use tx->dest recorded at group start */
       return;
     }
 
@@ -2002,7 +2011,16 @@ effectiveargv[effectiveargc] = 0;
     update_registrations(&eee);
 
     if ( eee.fec_enabled )
-      fec_rx_cleanup(&eee);
+      {
+        fec_rx_cleanup(&eee);
+
+        /* Flush a partially-filled FEC send group that has been idle too
+         * long, so sparse small-packet flows do not stall waiting for a
+         * full group. */
+        if ( eee.fec_tx.idx > 0 &&
+             ( nowTime - eee.fec_tx.first_seen ) >= FEC_FLUSH_TIMEOUT )
+          fec_tx_flush(&eee, NULL);
+      }
 
     numPurged =  purge_expired_registrations( &(eee.known_peers), 0);
     numPurged += purge_expired_registrations( &(eee.pending_peers), 1);
