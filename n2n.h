@@ -164,6 +164,12 @@ int unmarshall_n2n_packet_header( struct n2n_packet_header * hdr, const u_int8_t
 
 #define N2N_PKT_HDR_SIZE (sizeof(struct n2n_packet_header))
 
+/* Upper bound on the full on-wire FEC packet: n2n header + FEC header +
+ * length table + block payload. Used to size send/recv buffers so large
+ * FEC groups are never truncated. */
+#define FEC_MAX_PACKET \
+  ( N2N_PKT_HDR_SIZE + 16 + 16 * 2 + 2048 + 64 )
+
 
 /** Common type used to hold stringified IP addresses. */
 typedef char ipstr_t[32];

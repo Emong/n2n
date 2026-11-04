@@ -56,6 +56,9 @@
 #define FEC_LEN_TABLE(k) ((k) * 2)                     /* 2 bytes per block */
 #define FEC_PAYLOAD_OFF(k) (FEC_HDR_LEN + FEC_LEN_TABLE(k))
 #define FEC_MAX_PAYLOAD 2048
+/* FEC_MAX_PACKET (upper bound on the full on-wire FEC packet) is defined
+ * centrally in n2n.h so that both edge and supernode size their recv
+ * buffers identically and large FEC groups are never truncated. */
 /* Frames smaller than this are sent directly (no FEC buffering) to avoid
  * aggregation latency for interactive / small-packet flows. */
 #define FEC_DIRECT_SEND_THRESHOLD_DEFAULT 256
@@ -78,6 +81,7 @@ typedef struct fec_rx_group {
   int           r;           /* parity blocks in this group */
   int           n_recv;      /* number of blocks received so far */
   int           n_done;      /* number of data blocks recovered/emitted */
+  uint16_t      lens[FEC_MAX_K]; /* original length of each data block */
   fec_block_t   blk[FEC_MAX_K + FEC_MAX_R];
   time_t        last_seen;   /* for timeout cleanup */
   struct fec_rx_group *next;
@@ -877,13 +881,18 @@ static int fec_write_hdr(uint8_t *b, uint16_t group_id, uint16_t idx,
   return FEC_HDR_LEN + FEC_LEN_TABLE(k);
 }
 
-static int fec_read_hdr(const uint8_t *b, uint16_t *group_id, uint16_t *idx,
+static int fec_read_hdr(const uint8_t *b, size_t avail,
+                        uint16_t *group_id, uint16_t *idx,
                         int *k, int *r, uint16_t *seq_base,
                         uint16_t *lens /* k entries, optional */)
 {
   int i;
 
   if (!b)
+    return -1;
+  /* Fixed 12-byte FEC header: magic(3) + version(1) + group(2) + idx(2)
+   * + k(1) + r(1) + seq_base(2). */
+  if (avail < 12)
     return -1;
   if (b[0] != FEC_MAGIC0 || b[1] != FEC_MAGIC1 || b[2] != FEC_MAGIC2)
     return -1;
@@ -896,8 +905,15 @@ static int fec_read_hdr(const uint8_t *b, uint16_t *group_id, uint16_t *idx,
   *r        = b[9];
   *seq_base = ((uint16_t)b[10] << 8) | b[11];
 
+  /* The per-block length table (k uint16) must fit inside the available
+   * bytes before we dereference it; otherwise the block is malformed. */
+  if (*k < 0 || *k > FEC_MAX_K)
+    return -1;
+  if (avail < (size_t)(FEC_HDR_LEN + FEC_LEN_TABLE(*k)))
+    return -1;
+
   if (lens)
-    for (i = 0; i < *k && i < FEC_MAX_K; i++)
+    for (i = 0; i < *k; i++)
       lens[i] = ((uint16_t)b[FEC_HDR_LEN + i * 2] << 8) |
                 b[FEC_HDR_LEN + i * 2 + 1];
 
@@ -913,7 +929,7 @@ static void fec_send_block(n2n_edge_t * eee,
                            const uint16_t *lens,
                            const uint8_t *payload, size_t maxlen)
 {
-  uint8_t pkt[FEC_MAX_PAYLOAD + FEC_HDR_LEN + FEC_MAX_K * 2 + N2N_PKT_HDR_SIZE + 64];
+  uint8_t pkt[FEC_MAX_PACKET];
   uint8_t *body;
   size_t hdr_len, fec_len, total;
   struct n2n_packet_header hdr;
@@ -1346,10 +1362,14 @@ static int fec_rx_try_recover(n2n_edge_t * eee, fec_rx_group_t *g)
   if (g->n_recv < k)
     return 0; /* not enough yet */
 
-  /* Determine max data-block length in the group (for padding). */
+  /* Determine the padded maxlen from the full length table. This must be
+   * the max over ALL k data blocks, because the sender padded every block
+   * of the group to the largest block length. Using only the received
+   * blocks would under-size maxlen when the largest block is lost. */
+  maxlen = 0;
   for (i = 0; i < k; i++)
-    if (g->blk[i].valid && g->blk[i].len > maxlen)
-      maxlen = g->blk[i].len;
+    if (g->lens[i] > maxlen)
+      maxlen = g->lens[i];
   if (maxlen == 0)
     maxlen = FEC_MAX_PAYLOAD;
 
@@ -1376,15 +1396,14 @@ static int fec_rx_try_recover(n2n_edge_t * eee, fec_rx_group_t *g)
       return 0;
     }
 
-  /* Emit all k data blocks in order. */
+  /* Emit all k data blocks in order, using the real per-block length
+       * from the length table (the true size even for recovered blocks). */
   for (i = 0; i < k; i++)
     {
       fec_block_t out;
       memset(&out, 0, sizeof(out));
       out.valid = 1;
-      out.len   = (g->blk[i].valid && g->blk[i].len) ? g->blk[i].len : maxlen;
-      if (out.len > maxlen)
-        out.len = maxlen;
+      out.len   = (g->lens[i] <= maxlen) ? g->lens[i] : maxlen;
       memcpy(out.data, recovered[i], maxlen);
       fec_rx_emit(eee, &out);
     }
@@ -1414,8 +1433,9 @@ static void fec_rx_handle(n2n_edge_t * eee,
     return;
 
   /* Read the header; get the length table (used to know each data block's
-   * real length, and the padded max length). */
-  hdr_len = (size_t)fec_read_hdr(payload, &group_id, &idx, &k, &r,
+   * real length, and the padded max length). fec_read_hdr validates that
+   * the fixed header and the length table both fit inside plen. */
+  hdr_len = (size_t)fec_read_hdr(payload, plen, &group_id, &idx, &k, &r,
                                  &seq_base, lens);
   if (hdr_len == (size_t)-1)
     return;
@@ -1423,7 +1443,8 @@ static void fec_rx_handle(n2n_edge_t * eee,
     return;
   if ((int)idx < 0 || (int)idx >= k + r)
     return;
-  /* Length-table region must fit inside the received payload. */
+  /* The received payload must contain at least the header + length table
+   * (fec_read_hdr already guaranteed this); keep as a defensive guard. */
   if (plen < (size_t)hdr_len)
     return;
 
@@ -1444,6 +1465,10 @@ static void fec_rx_handle(n2n_edge_t * eee,
   g->base_seq  = seq_base;
   g->k = k;
   g->r = r;
+  /* Record the full length table so recovery can reconstruct the real
+   * length of a lost data block (and compute the padded maxlen). */
+  for (i = 0; i < k; i++)
+    g->lens[i] = lens[i];
 
   /* If the block slot is empty, store it (payload is padded to maxlen). */
   if (!g->blk[idx].valid)
@@ -1503,7 +1528,7 @@ void readFromIPSocket( n2n_edge_t * eee )
 {
   ipstr_t ip_buf;
   macstr_t mac_buf;
-  char packet[2048];
+  char packet[FEC_MAX_PACKET];
   char *decrypted_msg;
   size_t len;
   int data_sent_len;

@@ -1,3 +1,3 @@
 const char * version   = "1.3.2";
-const char * osName    = "x86_64";
-const char * buildDate = "07/19/20 05:20:31 PM";
+const char * osName    = "unknown";
+const char * buildDate = "11/04/26 06:31:52 PM";

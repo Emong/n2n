@@ -491,7 +491,7 @@ int main(int argc, char* argv[]) {
 
     if(rc > 0) {
       if(FD_ISSET(udp_sinfo.sock, &socket_mask)) {
-	char packet[2048];
+	char packet[FEC_MAX_PACKET];
 	size_t len;
 	struct peer_addr sender;
 	u_int8_t discarded_pkt;
