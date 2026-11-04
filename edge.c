@@ -24,6 +24,8 @@
 
 #include "minilzo.h"
 #include "n2n.h"
+#include "fec.h"
+#include <stdint.h>
 #include <assert.h>
 #include <sys/stat.h>
 
@@ -34,6 +36,60 @@
 #define MAX_CMDLINE_BUFFER_LENGTH    4096
 /* maximum length of a line in the configuration file */
 #define MAX_CONFFILE_LINE_LENGTH     1024
+
+/* ------------------------------------------------------------------ */
+/* Forward Error Correction (FEC) support                              */
+/* ------------------------------------------------------------------ */
+
+/* FEC wire protocol. A FEC packet is a normal n2n packet whose payload
+ * starts with this small header followed by one block of data. */
+#define FEC_MAGIC0      0xF4
+#define FEC_MAGIC1      0xEC
+#define FEC_MAGIC2      0x10
+#define FEC_VERSION     1
+/* Each FEC block, inside an n2n packet payload, is laid out as:
+ *   [0 .. 15]          FEC header (16 bytes)
+ *   [16 .. 16+2k-1)    per-block real lengths, k * uint16 (big-endian)
+ *   [16+2k .. ]        block payload, padded to the group maxlen
+ */
+#define FEC_HDR_LEN     16
+#define FEC_LEN_TABLE(k) ((k) * 2)                     /* 2 bytes per block */
+#define FEC_PAYLOAD_OFF(k) (FEC_HDR_LEN + FEC_LEN_TABLE(k))
+#define FEC_MAX_PAYLOAD 2048
+
+/* A single block in a FEC group. */
+typedef struct fec_block {
+  int          valid;        /* 1 if this slot holds a real block */
+  int          is_parity;    /* 1 = parity block, 0 = data block */
+  int          idx;          /* wire index: 0..k-1 data, k..k+r-1 parity */
+  uint16_t     seq;          /* base sequence of the group */
+  size_t       len;          /* length of the original data in block */
+  uint8_t      data[FEC_MAX_PAYLOAD];
+} fec_block_t;
+
+/* One in-flight FEC group (receive side). */
+typedef struct fec_rx_group {
+  uint16_t      group_id;    /* unique per sender */
+  uint16_t      base_seq;    /* first sequence of the group */
+  int           k;           /* data blocks in this group (from FEC header) */
+  int           r;           /* parity blocks in this group */
+  int           n_recv;      /* number of blocks received so far */
+  int           n_done;      /* number of data blocks recovered/emitted */
+  fec_block_t   blk[FEC_MAX_K + FEC_MAX_R];
+  time_t        last_seen;   /* for timeout cleanup */
+  struct fec_rx_group *next;
+} fec_rx_group_t;
+
+/* Per-destination send cache (one group per destination). */
+struct fec_tx_state {
+  uint16_t  seq_base;        /* base seq used when the group is flushed */
+  int       idx;             /* current data block index 0..k-1 */
+  uint16_t  group_id;
+  fec_block_t blk[FEC_MAX_K];
+  time_t    first_seen;
+};
+
+#define FEC_RX_GROUPS_MAX   16
 
 struct n2n_edge
 {
@@ -58,6 +114,13 @@ struct n2n_edge
   struct peer_info *  pending_peers /* = NULL*/;
   time_t              last_register /* = 0*/;
   u_int8_t            force_central;
+
+  /* FEC */
+  int                 fec_enabled;      /* set via -e */
+  int                 fec_k;            /* data blocks per group */
+  int                 fec_r;            /* parity blocks per group */
+  struct fec_tx_state fec_tx;           /* send-side cache */
+  fec_rx_group_t *    fec_rx_list;      /* receive-side groups */
 };
 
 static void supernode2addr(n2n_edge_t * eee, char* addr);
@@ -208,6 +271,11 @@ static int edge_init(n2n_edge_t * eee) {
   eee->known_peers   = NULL;
   eee->pending_peers = NULL;
   eee->last_register = 0;
+  eee->fec_enabled   = 0;
+  eee->fec_k         = 4;
+  eee->fec_r         = 2;
+  eee->fec_rx_list   = NULL;
+  memset(&eee->fec_tx, 0, sizeof(eee->fec_tx));
 
   if(lzo_init() != LZO_E_OK) {
     traceEvent(TRACE_ERROR, "LZO compression error");
@@ -264,6 +332,7 @@ static void help() {
 	 "\n"
 	 "-l <supernode host:port> "
 	 "[-p <local port>] [-M <mtu>] "
+	 "[-e] [-E <k:r>] "
 	 "[-t] [-r] [-v] [-b] [-h]\n\n");
 
 #ifdef __linux__
@@ -278,6 +347,9 @@ static void help() {
   printf("-b                       | Periodically resolve supernode IP\n");
   printf("                         | (when supernodes are running on dynamic IPs)\n");
   printf("-p <local port>          | Local port used for connecting to supernode\n");
+  printf("-e                       | Enable Forward Error Correction (FEC)\n");
+  printf("-E <k:r>                 | FEC group size k (data) : r (parity), default 4:2\n");
+  printf("                         | e.g. -E 8:4 means 8 data + 4 parity blocks/group\n");
 #ifndef WIN32
   printf("-u <UID>                 | User ID (numeric) to use when privileges are dropped\n");
   printf("-g <GID>                 | Group ID (numeric) to use when privileges are dropped\n");
@@ -735,6 +807,8 @@ static const struct option long_options[] = {
   { "tun-device",      required_argument, NULL, 'd' },
   { "euid",            required_argument, NULL, 'u' },
   { "egid",            required_argument, NULL, 'g' },
+  { "fec",             no_argument,       NULL, 'e' },
+  { "fec-group",       required_argument, NULL, 'E' },
   { "help"   ,         no_argument,       NULL, 'h' },
   { "verbose",         no_argument,       NULL, 'v' },
   { NULL,              0,                 NULL,  0  }
@@ -742,6 +816,184 @@ static const struct option long_options[] = {
 
 /* ***************************************************** */
 
+/* ------------------------------------------------------------------ */
+/* FEC send helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/* FEC block layout (per block, sent inside the n2n packet payload):
+ *   [0..15] FEC header (16 bytes)
+ *   [16 .. 16+2k-1]  per-block real lengths, k * uint16 big-endian
+ *   [16+2k .. ]       block payload, padded to the group maxlen
+ * The block payload is padded to maxlen for all blocks of the group so
+ * that the GF(256) matrix decode is well-defined.
+ */
+static int fec_write_hdr(uint8_t *b, uint16_t group_id, uint16_t idx,
+                         int k, int r, uint16_t seq_base,
+                         const uint16_t *lens /* k entries, big-endian */)
+{
+  int i;
+
+  b[0] = FEC_MAGIC0;
+  b[1] = FEC_MAGIC1;
+  b[2] = FEC_MAGIC2;
+  b[3] = FEC_VERSION;
+  b[4] = (group_id >> 8) & 0xff;
+  b[5] = group_id & 0xff;
+  b[6] = (idx >> 8) & 0xff;
+  b[7] = idx & 0xff;
+  b[8] = (uint8_t)k;
+  b[9] = (uint8_t)r;
+  b[10] = (seq_base >> 8) & 0xff;
+  b[11] = seq_base & 0xff;
+  b[12] = 0;
+  b[13] = 0;
+  b[14] = 0;
+  b[15] = 0;
+
+  for (i = 0; i < k && i < FEC_MAX_K; i++)
+    {
+      b[FEC_HDR_LEN + i * 2]     = (lens[i] >> 8) & 0xff;
+      b[FEC_HDR_LEN + i * 2 + 1] = lens[i] & 0xff;
+    }
+
+  return FEC_HDR_LEN + FEC_LEN_TABLE(k);
+}
+
+static int fec_read_hdr(const uint8_t *b, uint16_t *group_id, uint16_t *idx,
+                        int *k, int *r, uint16_t *seq_base,
+                        uint16_t *lens /* k entries, optional */)
+{
+  int i;
+
+  if (!b)
+    return -1;
+  if (b[0] != FEC_MAGIC0 || b[1] != FEC_MAGIC1 || b[2] != FEC_MAGIC2)
+    return -1;
+  if (b[3] != FEC_VERSION)
+    return -1;
+
+  *group_id = ((uint16_t)b[4] << 8) | b[5];
+  *idx      = ((uint16_t)b[6] << 8) | b[7];
+  *k        = b[8];
+  *r        = b[9];
+  *seq_base = ((uint16_t)b[10] << 8) | b[11];
+
+  if (lens)
+    for (i = 0; i < *k && i < FEC_MAX_K; i++)
+      lens[i] = ((uint16_t)b[FEC_HDR_LEN + i * 2] << 8) |
+                b[FEC_HDR_LEN + i * 2 + 1];
+
+  return FEC_HDR_LEN + FEC_LEN_TABLE(*k);
+}
+
+/* Send a single FEC block to destination. Every block of the group carries
+ * the same per-block length table (k uint16) and a payload padded to maxlen. */
+static void fec_send_block(n2n_edge_t * eee,
+                           const struct peer_addr *dest,
+                           uint16_t group_id, uint16_t seq_base,
+                           int idx, int k, int r,
+                           const uint16_t *lens,
+                           const uint8_t *payload, size_t maxlen)
+{
+  uint8_t pkt[FEC_MAX_PAYLOAD + FEC_HDR_LEN + FEC_MAX_K * 2 + N2N_PKT_HDR_SIZE + 64];
+  uint8_t *body;
+  size_t hdr_len, fec_len, total;
+  struct n2n_packet_header hdr;
+
+  memset(pkt, 0, sizeof(pkt));
+
+  /* Build n2n header. */
+  fill_standard_header_fields(&(eee->sinfo), &hdr, (char*)(eee->device.mac_addr));
+  hdr.msg_type = MSG_TYPE_PACKET;
+  hdr.sent_by_supernode = 0;
+  memcpy(hdr.community_name, eee->community_name, COMMUNITY_LEN);
+  /* store dst_mac placeholder. Use broadcast so routing lets it through. */
+  memset(hdr.dst_mac, 0xff, 6);
+
+  hdr_len = marshall_n2n_packet_header(pkt, &hdr);
+
+  body = pkt + hdr_len;
+
+  /* FEC sub-header + length table. */
+  fec_write_hdr(body, group_id, (uint16_t)idx, k, r, seq_base, lens);
+  fec_len = FEC_HDR_LEN + FEC_LEN_TABLE(k);
+  /* payload (padded to maxlen) */
+  memcpy(body + fec_len, payload, maxlen);
+
+  total = hdr_len + fec_len + maxlen;
+
+  send_packet(&(eee->sinfo), (char*)pkt, &total, dest, N2N_COMPRESSION_ENABLED);
+  ++(eee->pkt_sent);
+}
+
+/* Flush the tx cache: encode and send k data + r parity blocks. */
+static void fec_tx_flush(n2n_edge_t * eee, const struct peer_addr *dest)
+{
+  struct fec_tx_state *tx = &eee->fec_tx;
+  uint8_t *src[FEC_MAX_K];
+  uint8_t  parity[FEC_MAX_R][FEC_MAX_PAYLOAD];
+  uint8_t *dst[FEC_MAX_R];
+  uint16_t lens[FEC_MAX_K];
+  int i;
+  size_t maxlen = 0;
+
+  if (tx->idx == 0)
+    return; /* nothing buffered */
+
+  /* Determine the maximum block length in the group and the per-block lengths. */
+  for (i = 0; i < eee->fec_k; i++)
+    {
+      size_t l = (i < tx->idx) ? tx->blk[i].len : 0;
+      if (l > maxlen)
+        maxlen = l;
+      lens[i] = (uint16_t)l;
+    }
+  if (maxlen > FEC_MAX_PAYLOAD)
+    maxlen = FEC_MAX_PAYLOAD;
+
+  /* Build src pointers (pad short blocks to maxlen). */
+  for (i = 0; i < tx->idx; i++)
+    {
+      if (tx->blk[i].len < maxlen)
+        memset(tx->blk[i].data + tx->blk[i].len, 0, maxlen - tx->blk[i].len);
+      src[i] = tx->blk[i].data;
+    }
+  /* Fill the rest with empty blocks if k not reached. */
+  for (; i < eee->fec_k; i++)
+    {
+      memset(tx->blk[i].data, 0, maxlen);
+      tx->blk[i].valid = 1;
+      tx->blk[i].idx = i;
+      src[i] = tx->blk[i].data;
+    }
+
+  for (i = 0; i < eee->fec_r; i++)
+    dst[i] = parity[i];
+
+  if (fec_encode(eee->fec_k, eee->fec_r, src, dst, maxlen) != 0)
+    {
+      traceEvent(TRACE_WARNING, "FEC encode failed");
+      return;
+    }
+
+  /* Send data blocks (padded to maxlen so the receiver can decode). */
+  for (i = 0; i < eee->fec_k; i++)
+    fec_send_block(eee, dest, tx->group_id, tx->seq_base, i,
+                   eee->fec_k, eee->fec_r, lens, tx->blk[i].data, maxlen);
+
+  /* Send parity blocks. */
+  for (i = 0; i < eee->fec_r; i++)
+    fec_send_block(eee, dest, tx->group_id, tx->seq_base,
+                   eee->fec_k + i, eee->fec_k, eee->fec_r, lens, parity[i], maxlen);
+
+  traceEvent(TRACE_INFO, "FEC: flushed group id=%d k=%d r=%d len=%d",
+             tx->group_id, eee->fec_k, eee->fec_r, (int)maxlen);
+
+  /* reset */
+  tx->idx = 0;
+  tx->group_id++;
+  tx->seq_base += eee->fec_k;
+}
 
 /** A layer-2 packet was received at the tunnel and needs to be sent via UDP. */
 static void send_packet2net(n2n_edge_t * eee,
@@ -768,7 +1020,7 @@ static void send_packet2net(n2n_edge_t * eee,
       if( dst != eee->device.ip_addr) {
 		/* This is a packet that needs to be routed */
 		traceEvent(TRACE_INFO, "Discarding routed packet [%s]", 
-				               intoa(ntohl(dst), ip_buf, sizeof(ip_buf)));
+			  intoa(ntohl(dst), ip_buf, sizeof(ip_buf)));
 		return;
       } else {
 	/* This packet is originated by us */
@@ -782,6 +1034,46 @@ static void send_packet2net(n2n_edge_t * eee,
 	//		  (u_int8_t *)&packet[N2N_PKT_HDR_SIZE], len, eee->enc_tf);
   //memcpy(packet+N2N_PKT_HDR_SIZE,(u_int8_t *)decrypted_msg,len);
 
+  /* FEC path: buffer the frame and flush when k frames are collected. */
+  if (eee->fec_enabled)
+    {
+      struct fec_tx_state *tx = &eee->fec_tx;
+
+      /* If the frame is too large for the FEC block buffer, send it
+       * natively (no FEC) and continue. */
+      if (len > FEC_MAX_PAYLOAD)
+        {
+          traceEvent(TRACE_WARNING, "FEC: frame too large (%d), sending natively", (int)len);
+          goto native_send;
+        }
+
+      if (tx->idx == 0)
+        {
+          tx->group_id++;
+          tx->seq_base++;
+          tx->first_seen = nowTime;
+        }
+
+      /* buffer this frame as the next data block.
+       * The actual L2 frame is at decrypted_msg + N2N_PKT_HDR_SIZE. */
+      tx->blk[tx->idx].valid = 1;
+      tx->blk[tx->idx].len   = len;
+      memcpy(tx->blk[tx->idx].data, decrypted_msg + N2N_PKT_HDR_SIZE, len);
+      tx->blk[tx->idx].idx   = tx->idx;
+      tx->idx++;
+
+      /* flush when the group is full */
+      if (tx->idx >= eee->fec_k)
+        {
+          if (find_peer_destination(eee, eh->ether_dhost, &destination))
+            fec_tx_flush(eee, &destination);
+          else
+            fec_tx_flush(eee, &(eee->supernode));
+        }
+      return;
+    }
+
+native_send:
   /* Add the n2n header to the start of the n2n packet. */
   fill_standard_header_fields( &(eee->sinfo), &hdr, (char*)(eee->device.mac_addr) );
   hdr.msg_type = MSG_TYPE_PACKET;
@@ -794,7 +1086,7 @@ static void send_packet2net(n2n_edge_t * eee,
   len += N2N_PKT_HDR_SIZE;
 
   if(find_peer_destination(eee, eh->ether_dhost, &destination))
-    traceEvent(TRACE_INFO, "** Going direct [dst_mac=%s][dest=%s:%hu]",
+    traceEvent(TRACE_INFO, "   Going direct [dst_mac=%s][dest=%s:%hu]",
 	       macaddr_str((char*)eh->ether_dhost, mac_buf, sizeof(mac_buf)),
 	       intoa(ntohl(destination.addr_type.v4_addr), ip_buf, sizeof(ip_buf)),
 	       ntohs(destination.port));
@@ -807,7 +1099,7 @@ static void send_packet2net(n2n_edge_t * eee,
                                    N2N_COMPRESSION_ENABLED);
 
   if(data_sent_len != len)
-    traceEvent(TRACE_WARNING, "sendto() [sent=%d][attempted_to_send=%d] [%s]\n",
+    traceEvent(TRACE_WARNING, "   sendto() [sent=%d][attempted_to_send=%d] [%s]\n",
 	       data_sent_len, len, strerror(errno));
   else {
     ++(eee->pkt_sent);
@@ -936,6 +1228,249 @@ static void readFromTAPSocket( n2n_edge_t * eee )
 /* ***************************************************** */
 
 
+/* ------------------------------------------------------------------ */
+/* FEC receive helpers                                                */
+/* ------------------------------------------------------------------ */
+
+/* Find or allocate an rx group for the given group_id. */
+static fec_rx_group_t * fec_rx_find(n2n_edge_t * eee, uint16_t group_id)
+{
+  fec_rx_group_t *g = eee->fec_rx_list;
+  fec_rx_group_t *prev = NULL;
+
+  while (g)
+    {
+      if (g->group_id == group_id)
+        return g;
+      prev = g;
+      g = g->next;
+    }
+
+  /* Not found: allocate a new one (reuse oldest if over the cap). */
+  if (eee->fec_rx_list == NULL)
+    {
+      g = (fec_rx_group_t*)calloc(1, sizeof(fec_rx_group_t));
+      if (!g)
+        return NULL;
+      g->group_id = group_id;
+      eee->fec_rx_list = g;
+      return g;
+    }
+
+  /* count groups */
+  {
+    int n = 0;
+    fec_rx_group_t *s = eee->fec_rx_list;
+    while (s) { ++n; s = s->next; }
+    if (n < FEC_RX_GROUPS_MAX)
+      {
+        g = (fec_rx_group_t*)calloc(1, sizeof(fec_rx_group_t));
+        if (!g)
+          return NULL;
+        g->group_id = group_id;
+        /* append */
+        g->next = NULL;
+        prev->next = g;   /* prev is last non-null (loop ended on g==NULL) */
+        return g;
+      }
+    else
+      {
+        /* drop the whole oldest list and reuse head slot */
+        fec_rx_group_t *old = eee->fec_rx_list;
+        eee->fec_rx_list = old->next;
+        memset(old, 0, sizeof(fec_rx_group_t));
+        old->group_id = group_id;
+        return old;
+      }
+  }
+}
+
+/* Emit a recovered data block (an L2 frame) to the TAP. */
+static void fec_rx_emit(n2n_edge_t * eee, const fec_block_t *blk)
+{
+  int data_sent_len;
+
+  data_sent_len = tuntap_write(&(eee->device), (u_char*)blk->data, blk->len);
+  if (data_sent_len != (int)blk->len)
+    traceEvent(TRACE_WARNING, "FEC tuntap_write() [sent=%d][len=%d] [%s]\n",
+               data_sent_len, (int)blk->len, strerror(errno));
+  else
+    traceEvent(TRACE_INFO, "### FEC Tx L2 Msg -> tun (%d bytes)", (int)blk->len);
+}
+
+/* Try to recover the whole group if enough blocks are present.
+ * Returns 1 if the group is complete and was emitted, 0 otherwise. */
+static int fec_rx_try_recover(n2n_edge_t * eee, fec_rx_group_t *g)
+{
+  const uint8_t *recv[FEC_MAX_K];
+  uint8_t       *dst[FEC_MAX_K];
+  int            idx[FEC_MAX_K];
+  int            n = 0;
+  int            i;
+  size_t         maxlen = 0;
+  uint8_t        recovered[FEC_MAX_K][FEC_MAX_PAYLOAD];
+  int            k = g->k;
+  int            r = g->r;
+
+  if (k <= 0 || k > FEC_MAX_K)
+    return 0;
+
+  if (g->n_recv < k)
+    return 0; /* not enough yet */
+
+  /* Determine max data-block length in the group (for padding). */
+  for (i = 0; i < k; i++)
+    if (g->blk[i].valid && g->blk[i].len > maxlen)
+      maxlen = g->blk[i].len;
+  if (maxlen == 0)
+    maxlen = FEC_MAX_PAYLOAD;
+
+  /* Gather up to k received blocks (data+parity) and their wire indices. */
+  for (i = 0; i < k + r; i++)
+    {
+      if (g->blk[i].valid && n < k)
+        {
+          recv[n] = g->blk[i].data;
+          idx[n]  = g->blk[i].idx;
+          ++n;
+        }
+    }
+
+  if (n < k)
+    return 0;
+
+  for (i = 0; i < k; i++)
+    dst[i] = recovered[i];
+
+  if (fec_decode(k, r, dst, recv, idx, n, maxlen) != 0)
+    {
+      traceEvent(TRACE_WARNING, "FEC decode failed");
+      return 0;
+    }
+
+  /* Emit all k data blocks in order. */
+  for (i = 0; i < k; i++)
+    {
+      fec_block_t out;
+      memset(&out, 0, sizeof(out));
+      out.valid = 1;
+      out.len   = (g->blk[i].valid && g->blk[i].len) ? g->blk[i].len : maxlen;
+      if (out.len > maxlen)
+        out.len = maxlen;
+      memcpy(out.data, recovered[i], maxlen);
+      fec_rx_emit(eee, &out);
+    }
+
+  return 1;
+}
+
+/* Insert a received FEC block into the matching group and try recovery. */
+static void fec_rx_handle(n2n_edge_t * eee,
+                          const uint8_t *payload, size_t plen)
+{
+  uint16_t group_id, idx, seq_base;
+  uint16_t lens[FEC_MAX_K];
+  int      k, r;
+  size_t   hdr_len;
+  size_t   blk_len, maxlen;
+  fec_rx_group_t *g;
+  int      i;
+
+  if (!eee->fec_enabled)
+    return;
+
+  /* Sanity guard: a legal FEC packet must at least contain the magic,
+   * version and the k/r/idx/seq fields (12 bytes) so fec_read_hdr can
+   * safely parse the fixed header before we validate the length table. */
+  if (plen < 12)
+    return;
+
+  /* Read the header; get the length table (used to know each data block's
+   * real length, and the padded max length). */
+  hdr_len = (size_t)fec_read_hdr(payload, &group_id, &idx, &k, &r,
+                                 &seq_base, lens);
+  if (hdr_len == (size_t)-1)
+    return;
+  if (k <= 0 || k > FEC_MAX_K || r > FEC_MAX_R)
+    return;
+  if ((int)idx < 0 || (int)idx >= k + r)
+    return;
+  /* Length-table region must fit inside the received payload. */
+  if (plen < (size_t)hdr_len)
+    return;
+
+  /* Compute the padded maxlen = max(lens[]). */
+  maxlen = 0;
+  for (i = 0; i < k; i++)
+    if (lens[i] > maxlen)
+      maxlen = lens[i];
+
+  if (hdr_len + maxlen > plen)
+    return; /* truncated payload */
+
+  g = fec_rx_find(eee, group_id);
+  if (!g)
+    return;
+
+  g->last_seen = nowTime;
+  g->base_seq  = seq_base;
+  g->k = k;
+  g->r = r;
+
+  /* If the block slot is empty, store it (payload is padded to maxlen). */
+  if (!g->blk[idx].valid)
+    {
+      g->blk[idx].valid     = 1;
+      g->blk[idx].idx       = idx;
+      g->blk[idx].is_parity = (idx >= k) ? 1 : 0;
+      g->blk[idx].len       = (idx < k) ? lens[idx] : maxlen;
+      g->blk[idx].seq       = seq_base;
+      memcpy(g->blk[idx].data, payload + hdr_len, maxlen);
+      g->n_recv++;
+    }
+
+  if (fec_rx_try_recover(eee, g))
+    {
+      /* group done: drop it from the list */
+      fec_rx_group_t *scan = eee->fec_rx_list;
+      fec_rx_group_t *prv  = NULL;
+      while (scan && scan != g) { prv = scan; scan = scan->next; }
+      if (scan)
+        {
+          if (prv) prv->next = scan->next;
+          else     eee->fec_rx_list = scan->next;
+          free(scan);
+        }
+    }
+}
+
+/* Cleanup FEC rx groups that are too old. */
+static void fec_rx_cleanup(n2n_edge_t * eee)
+{
+  fec_rx_group_t *g = eee->fec_rx_list;
+  fec_rx_group_t *p = NULL;
+  time_t cutoff = nowTime - 5;
+
+  while (g)
+    {
+      fec_rx_group_t *next = g->next;
+      if (g->last_seen < cutoff)
+        {
+          if (p) p->next = next;
+          else   eee->fec_rx_list = next;
+          free(g);
+        }
+      else
+        {
+          p = g;
+        }
+      g = next;
+    }
+}
+
+/* ***************************************************** */
+
+
 void readFromIPSocket( n2n_edge_t * eee )
 {
   ipstr_t ip_buf;
@@ -1005,6 +1540,18 @@ void readFromIPSocket( n2n_edge_t * eee )
 	    //len = TwoFishDecryptRaw((u_int8_t *)&packet[N2N_PKT_HDR_SIZE],
 			//	    (u_int8_t *)decrypted_msg, len, eee->dec_tf);
       decrypted_msg = packet + N2N_PKT_HDR_SIZE;
+
+      /* FEC packet detection: payload starts with the FEC magic. */
+      if (eee->fec_enabled &&
+          len >= (int)FEC_HDR_LEN &&
+          (u_char)decrypted_msg[0] == FEC_MAGIC0 &&
+          (u_char)decrypted_msg[1] == FEC_MAGIC1 &&
+          (u_char)decrypted_msg[2] == FEC_MAGIC2)
+        {
+          fec_rx_handle(eee, (const uint8_t*)decrypted_msg, (size_t)len);
+          fec_rx_cleanup(eee);
+          return;
+        }
 
 	    if(len > 0) {
 	      if(check_received_packet(eee, decrypted_msg, len) == 0) {
@@ -1243,12 +1790,31 @@ effectiveargv[effectiveargc] = 0;
   /* {int k;for(k=0;k<effectiveargc;++k)  printf("%s\n",effectiveargv[k]);} */
 
   optarg = NULL;
-  while((opt = getopt_long(effectiveargc, effectiveargv, "k:a:bc:Cu:g:m:M:s:d:l:p:fvhrt", long_options, NULL)) != EOF) {
+  while((opt = getopt_long(effectiveargc, effectiveargv, "k:a:bc:Cu:g:m:M:s:d:l:p:e:E:fvhrt", long_options, NULL)) != EOF) {
     switch (opt) {
     case 'a':
 		  printf("%s\n", optarg);
       ip_addr = strdup(optarg);
       break;
+    case 'e': /* enable FEC */
+      eee.fec_enabled = 1;
+      break;
+    case 'E': /* FEC group k:r */
+      {
+        int k, r;
+        if (sscanf(optarg, "%d:%d", &k, &r) == 2 &&
+            k >= 1 && k <= FEC_MAX_K && r >= 0 && r <= FEC_MAX_R)
+          {
+            eee.fec_k = k;
+            eee.fec_r = r;
+            eee.fec_enabled = 1;
+          }
+        else
+          {
+            traceEvent(TRACE_WARNING, "Invalid -E argument '%s', using default 4:2", optarg);
+          }
+        break;
+      }
     case 'c': /* community */
       eee.community_name = strdup(optarg);
       if(strlen(eee.community_name) > COMMUNITY_LEN)
@@ -1434,6 +2000,9 @@ effectiveargv[effectiveargc] = 0;
       }
 
     update_registrations(&eee);
+
+    if ( eee.fec_enabled )
+      fec_rx_cleanup(&eee);
 
     numPurged =  purge_expired_registrations( &(eee.known_peers), 0);
     numPurged += purge_expired_registrations( &(eee.pending_peers), 1);
