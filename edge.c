@@ -56,6 +56,9 @@
 #define FEC_LEN_TABLE(k) ((k) * 2)                     /* 2 bytes per block */
 #define FEC_PAYLOAD_OFF(k) (FEC_HDR_LEN + FEC_LEN_TABLE(k))
 #define FEC_MAX_PAYLOAD 2048
+/* Frames smaller than this are sent directly (no FEC buffering) to avoid
+ * aggregation latency for interactive / small-packet flows. */
+#define FEC_DIRECT_SEND_THRESHOLD_DEFAULT 256
 
 /* A single block in a FEC group. */
 typedef struct fec_block {
@@ -91,8 +94,8 @@ struct fec_tx_state {
 };
 
 #define FEC_RX_GROUPS_MAX   16
-#define FEC_FLUSH_TIMEOUT   3   /* seconds; flush a partial FEC group
-                                   even if not full, to keep latency low */
+#define FEC_FLUSH_TIMEOUT_DEFAULT 3 /* seconds; flush a partial FEC group
+                                       even if not full, to keep latency low */
 
 struct n2n_edge
 {
@@ -122,6 +125,8 @@ struct n2n_edge
   int                 fec_enabled;      /* set via -e */
   int                 fec_k;            /* data blocks per group */
   int                 fec_r;            /* parity blocks per group */
+  int                 fec_flush_timeout;  /* secs, flush partial group (-T) */
+  int                 fec_direct_threshold; /* bytes, small-packet direct send (-S) */
   struct fec_tx_state fec_tx;           /* send-side cache */
   fec_rx_group_t *    fec_rx_list;      /* receive-side groups */
 };
@@ -277,6 +282,8 @@ static int edge_init(n2n_edge_t * eee) {
   eee->fec_enabled   = 0;
   eee->fec_k         = 4;
   eee->fec_r         = 2;
+  eee->fec_flush_timeout = FEC_FLUSH_TIMEOUT_DEFAULT;
+  eee->fec_direct_threshold = FEC_DIRECT_SEND_THRESHOLD_DEFAULT;
   eee->fec_rx_list   = NULL;
   memset(&eee->fec_tx, 0, sizeof(eee->fec_tx));
 
@@ -335,7 +342,7 @@ static void help() {
 	 "\n"
 	 "-l <supernode host:port> "
 	 "[-p <local port>] [-M <mtu>] "
-	 "[-e] [-E <k:r>] "
+	 "[-e] [-E <k:r>] [-S <bytes>] [-T <secs>] "
 	 "[-t] [-r] [-v] [-b] [-h]\n\n");
 
 #ifdef __linux__
@@ -353,6 +360,12 @@ static void help() {
   printf("-e                       | Enable Forward Error Correction (FEC)\n");
   printf("-E <k:r>                 | FEC group size k (data) : r (parity), default 4:2\n");
   printf("                         | e.g. -E 8:4 means 8 data + 4 parity blocks/group\n");
+  printf("-S <bytes>               | Small-packet direct-send threshold, default %d\n",
+         FEC_DIRECT_SEND_THRESHOLD_DEFAULT);
+  printf("                         | Frames smaller than this bypass FEC (lower latency)\n");
+  printf("-T <secs>                | FEC partial-group flush timeout, default %d secs\n",
+         FEC_FLUSH_TIMEOUT_DEFAULT);
+  printf("                         | Flush a not-yet-full group after this idle time\n");
 #ifndef WIN32
   printf("-u <UID>                 | User ID (numeric) to use when privileges are dropped\n");
   printf("-g <GID>                 | Group ID (numeric) to use when privileges are dropped\n");
@@ -812,6 +825,8 @@ static const struct option long_options[] = {
   { "egid",            required_argument, NULL, 'g' },
   { "fec",             no_argument,       NULL, 'e' },
   { "fec-group",       required_argument, NULL, 'E' },
+  { "fec-flush-timeout", required_argument, NULL, 'T' },
+  { "fec-direct-threshold", required_argument, NULL, 'S' },
   { "help"   ,         no_argument,       NULL, 'h' },
   { "verbose",         no_argument,       NULL, 'v' },
   { NULL,              0,                 NULL,  0  }
@@ -1047,11 +1062,15 @@ static void send_packet2net(n2n_edge_t * eee,
     {
       struct fec_tx_state *tx = &eee->fec_tx;
 
-      /* If the frame is too large for the FEC block buffer, send it
-       * natively (no FEC) and continue. */
-      if (len > FEC_MAX_PAYLOAD)
+      /* If the frame is too large for the FEC block buffer, or small
+       * enough to be a latency-sensitive interactive packet, send it
+       * natively (no FEC) immediately instead of buffering. */
+      if (len > FEC_MAX_PAYLOAD ||
+          len < eee->fec_direct_threshold)
         {
-          traceEvent(TRACE_WARNING, "FEC: frame too large (%d), sending natively", (int)len);
+          traceEvent(TRACE_INFO, "FEC: %s frame (%d), sending natively",
+                     (len < eee->fec_direct_threshold) ? "small" : "too large",
+                     (int)len);
           goto native_send;
         }
 
@@ -1799,7 +1818,7 @@ effectiveargv[effectiveargc] = 0;
   /* {int k;for(k=0;k<effectiveargc;++k)  printf("%s\n",effectiveargv[k]);} */
 
   optarg = NULL;
-  while((opt = getopt_long(effectiveargc, effectiveargv, "k:a:bc:Cu:g:m:M:s:d:l:p:e:E:fvhrt", long_options, NULL)) != EOF) {
+  while((opt = getopt_long(effectiveargc, effectiveargv, "k:a:bc:Cu:g:m:M:s:d:l:p:e:E:S:T:fvhrt", long_options, NULL)) != EOF) {
     switch (opt) {
     case 'a':
 		  printf("%s\n", optarg);
@@ -1824,6 +1843,26 @@ effectiveargv[effectiveargc] = 0;
           }
         break;
       }
+    case 'S': /* FEC small-packet direct-send threshold (bytes) */
+      eee.fec_direct_threshold = atoi(optarg);
+      if (eee.fec_direct_threshold <= 0)
+        {
+          traceEvent(TRACE_WARNING, "Invalid -S argument '%s', using default %d",
+                     optarg, FEC_DIRECT_SEND_THRESHOLD_DEFAULT);
+          eee.fec_direct_threshold = FEC_DIRECT_SEND_THRESHOLD_DEFAULT;
+        }
+      eee.fec_enabled = 1;
+      break;
+    case 'T': /* FEC partial-group flush timeout (seconds) */
+      eee.fec_flush_timeout = atoi(optarg);
+      if (eee.fec_flush_timeout <= 0)
+        {
+          traceEvent(TRACE_WARNING, "Invalid -T argument '%s', using default %d",
+                     optarg, FEC_FLUSH_TIMEOUT_DEFAULT);
+          eee.fec_flush_timeout = FEC_FLUSH_TIMEOUT_DEFAULT;
+        }
+      eee.fec_enabled = 1;
+      break;
     case 'c': /* community */
       eee.community_name = strdup(optarg);
       if(strlen(eee.community_name) > COMMUNITY_LEN)
@@ -2018,7 +2057,7 @@ effectiveargv[effectiveargc] = 0;
          * long, so sparse small-packet flows do not stall waiting for a
          * full group. */
         if ( eee.fec_tx.idx > 0 &&
-             ( nowTime - eee.fec_tx.first_seen ) >= FEC_FLUSH_TIMEOUT )
+             ( nowTime - eee.fec_tx.first_seen ) >= eee.fec_flush_timeout )
           fec_tx_flush(&eee, NULL);
       }
 
